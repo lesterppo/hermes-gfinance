@@ -1,0 +1,8 @@
+name: hermes_gfinance
+description: Hermes-native Google Finance tool - full site Wiz AF parse, 25 actions, no API key. Survives hermes update.
+author: Peter (lesterppo)
+version: 1.0.0
+license: MIT
+kind: standalone
+tags: [gfinance, google-finance, wiz, finance, quote, market-data, hermes-tool]
+homepage: https://github.com/lesterppo/hermes-gfinance
