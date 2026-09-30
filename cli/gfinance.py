@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Standalone CLI wrapper for gfinance_tool — also usable outside Hermes."""
-import sys, json, argparse, os
+import sys, json, argparse, os, re
 sys.path.insert(0, os.path.expanduser("~/.hermes/plugins/hermes_local_tools"))
 import gfinance_tool
 
@@ -11,9 +11,23 @@ def main():
     p.add_argument("--query","-q", default="")
     p.add_argument("--window","-w", default="")
     p.add_argument("--pretty", action="store_true")
-    a=p.parse_args()
+    a, extra = p.parse_known_args()
     # map positional ticker to correct field
     kwargs=dict(action=a.action, ticker=a.ticker, query=a.query, window=a.window)
+    # accept key=value extras (e.g. convert amount=100 from=USD to=EUR,
+    # compare AAPL:NASDAQ comparisons=MSFT:NASDAQ,GOOGL:NASDAQ,
+    # chat message='...' session=abc). Note: argparse grabs the first
+    # key=value token as the ticker positional, so reclassify it.
+    kv_tokens = list(extra)
+    if re.match(r"^[A-Za-z_][\w.-]*=", kwargs["ticker"] or ""):
+        kv_tokens.insert(0, kwargs["ticker"])
+        kwargs["ticker"] = ""
+    for tok in kv_tokens:
+        m = re.match(r"^([A-Za-z_][\w.-]*)=(.*)$", tok)
+        if m:
+            kwargs[m.group(1)] = m.group(2)
+        else:
+            p.error(f"unrecognized arguments: {tok}")
     out=gfinance_tool.gfinance_run(**kwargs)
     if a.pretty:
         try: print(json.dumps(json.loads(out), indent=2, ensure_ascii=False))

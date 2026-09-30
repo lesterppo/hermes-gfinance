@@ -185,27 +185,29 @@ def _extract_quote(blocks: Dict[str, Any]) -> Dict[str, Any]:
                     "_src": k,
                 }
             elif k == "ds:10":
+                # 2026-09 layout: ds:10[0][0] is a 10-field session record:
+                # [ [ticker, exch], mid, currency, sessions, None,
+                #   tz_offset_sec, price, name, bar_interval_sec, 0 ]
                 row = v[0][0]
-                if not isinstance(row, list) or len(row) < 16:
+                if not isinstance(row, list) or len(row) < 8:
                     continue
-                pair = row[0][1] if isinstance(row[0], list) and len(row[0]) > 1 else [None, None]
-                price = row[2]
-                mid = row[3]
-                prev = row[15] if len(row) > 15 else None
-                chg = row[8] if len(row) > 8 else None
-                chgp = row[10] if len(row) > 10 else None
-                cur = row[12] if len(row) > 12 else None
-                name = row[14] if len(row) > 14 else None
+                if not isinstance(row[3], list):
+                    continue  # not the session-record shape; skip
+                pair = row[0] if isinstance(row[0], list) else [None, None]
+                price = row[6]
+                if not isinstance(price, (int, float)):
+                    continue
                 return {
-                    "t": pair[0] if isinstance(pair, list) and len(pair) > 0 else None,
-                    "ex": pair[1] if isinstance(pair, list) and len(pair) > 1 else None,
-                    "mid": mid,
-                    "name": name,
-                    "cur": cur,
+                    "t": pair[0] if len(pair) > 0 else None,
+                    "ex": pair[1] if len(pair) > 1 else None,
+                    "mid": row[1] if isinstance(row[1], str) else None,
+                    "name": row[7] if isinstance(row[7], str) else None,
+                    "cur": row[2] if isinstance(row[2], str) else None,
                     "p": _rnd(price),
-                    "ch": _rnd(chg),
-                    "chp": _rnd(chgp if isinstance(chgp, (int, float)) else chgp),
-                    "prev": _rnd(prev),
+                    "ch": None,
+                    "chp": None,
+                    "prev": None,
+                    "tz": row[5] if isinstance(row[5], (int, float)) else None,
                     "_src": k,
                 }
         except Exception:
@@ -276,7 +278,11 @@ def _extract_minute(blocks: Dict[str, Any]) -> List[Dict[str, Any]]:
                     price_arr = x[1]
                     vol = x[2]
                     if len(ts_arr) >= 5 and isinstance(price_arr, list) and len(price_arr) >= 1:
-                        y, mo, d, h, mi = ts_arr[0], ts_arr[1], ts_arr[2], ts_arr[3], ts_arr[4]
+                        y, mo, d = ts_arr[0] or 0, ts_arr[1] or 0, ts_arr[2] or 0
+                        # ds:11 daily closes arrive with null minutes (and sometimes null hours);
+                        # None.__format__ would raise, which the outer try would swallow -> empty list
+                        h = ts_arr[3] if isinstance(ts_arr[3], int) else 0
+                        mi = ts_arr[4] if isinstance(ts_arr[4], int) else 0
                         iso = f"{y:04d}-{mo:02d}-{d:02d}T{h:02d}:{mi:02d}:00"
                         out.append({"t": iso, "p": price_arr[0], "ch": price_arr[1] if len(price_arr) > 1 else None, "chp": price_arr[2] if len(price_arr) > 2 else None, "vol": vol})
                         return
@@ -287,9 +293,68 @@ def _extract_minute(blocks: Dict[str, Any]) -> List[Dict[str, Any]]:
     except Exception:
         return out
 
+def _extract_session_bars(blocks: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """True 5-minute bars for the current trading session.
+
+    Lives at ds:10[0][0][3] = [ [session_meta, [bars...]], ... ] where each bar
+    is [ [Y,M,D,h,mi,...], [price, chg, pct, ...], volume ]. Google moved the
+    quote record into ds:10[0][0] itself (2026-09), so the old ds:10 intraday
+    walker is obsolete.
+    """
+    out: List[Dict[str, Any]] = []
+    try:
+        v = blocks.get("ds:10")
+        if not v or not isinstance(v, list):
+            return out
+        rec = v[0][0] if isinstance(v[0], list) and v[0] and isinstance(v[0][0], list) else None
+        if not isinstance(rec, list) or len(rec) < 4 or not isinstance(rec[3], list):
+            return out
+        for sess in rec[3]:
+            if not isinstance(sess, list) or len(sess) < 2 or not isinstance(sess[1], list):
+                continue
+            for c in sess[1]:
+                if not isinstance(c, list) or len(c) != 3:
+                    continue
+                ts, pr, vol = c
+                if not (isinstance(ts, list) and len(ts) >= 5 and isinstance(pr, list) and pr):
+                    continue
+                y, mo, d = ts[0] or 0, ts[1] or 0, ts[2] or 0
+                h = ts[3] if isinstance(ts[3], int) else 0
+                mi = ts[4] if isinstance(ts[4], int) else 0
+                out.append({
+                    "t": f"{y:04d}-{mo:02d}-{d:02d}T{h:02d}:{mi:02d}:00",
+                    "p": _rnd(pr[0]) if isinstance(pr[0], (int, float)) else None,
+                    "vol": vol if isinstance(vol, (int, float)) else None,
+                })
+    except Exception:
+        pass
+    return out
+
+def _daily_from_ohlc(blocks: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Fallback daily series derived from ds:12's ~21 daily OHLC candles.
+
+    _extract_daily's ds:13 source is absent on some page variants (Google only
+    embeds the series in ds:13 on some fetches); ds:12 reliably carries the
+    same 21 daily candles, so use it instead of returning nothing.
+    """
+    out: List[Dict[str, Any]] = []
+    for c in _extract_ohlc_intraday(blocks):
+        v = c.get("v") or []
+        if len(v) >= 4:
+            out.append({"d": (c.get("t") or "")[:10], "o": v[0], "c": v[1],
+                        "h": v[2], "l": v[3], "vol": c.get("vol"), "_k": "ds:12"})
+    return out
+
+def _daily_series(blocks: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Daily candles with the ds:12 fallback applied."""
+    daily = _extract_daily(blocks)
+    return daily if daily else _daily_from_ohlc(blocks)
+
 def _extract_daily(blocks: Dict[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    for k in ("ds:13", "ds:14"):
+    # ds:14 is quarterly fundamentals, not daily OHLC (old docs were wrong),
+    # so only ds:13 is scanned here; use _daily_series() for the ds:12 fallback
+    for k in ("ds:13",):
         v = blocks.get(k)
         if not v:
             continue
@@ -303,8 +368,7 @@ def _extract_daily(blocks: Dict[str, Any]) -> List[Dict[str, Any]]:
                         if len(ts_arr) >= 3 and ts_arr[0] and ts_arr[1] and ts_arr[2] and isinstance(price_arr, list):
                             y, mo, d = ts_arr[0], ts_arr[1], ts_arr[2]
                             iso = f"{y:04d}-{mo:02d}-{d:02d}"
-                            if k == "ds:13":
-                                out.append({"d": iso, "p": price_arr[0], "ch": price_arr[1] if len(price_arr) > 1 else None, "chp": price_arr[2] if len(price_arr) > 2 else None, "vol": vol})
+                            out.append({"d": iso, "p": price_arr[0], "ch": price_arr[1] if len(price_arr) > 1 else None, "chp": price_arr[2] if len(price_arr) > 2 else None, "vol": vol})
                             return
                     if len(x) == 6 and isinstance(x[4], str) and "T" in x[4] and isinstance(x[0], (int, float)):
                         out.append({"d": x[4][:10], "o": x[0], "c": x[1], "h": x[2], "l": x[3], "vol": x[5], "_k": k})
@@ -379,22 +443,70 @@ def _extract_news(blocks: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out[:30]
 
 def _extract_analyst(blocks: Dict[str, Any]) -> Dict[str, Any]:
-    v = blocks.get("ds:7")
-    if not v or not isinstance(v, list):
-        return {}
-    try:
-        summ = v[0] if len(v) > 0 and isinstance(v[0], list) else []
-        recs = v[1] if len(v) > 1 and isinstance(v[1], list) else []
-        analysts = []
-        for r in recs[:50]:
-            if not isinstance(r, list) or len(r) < 6:
+    # Google moved analyst summary+recs ds:7 -> ds:6 (2026-09); ds:7 now holds
+    # earnings-estimate rows. Validate the recs shape before accepting a block.
+    for k in ("ds:6", "ds:7"):
+        v = blocks.get(k)
+        if not v or not isinstance(v, list):
+            continue
+        try:
+            summ = v[0] if len(v) > 0 and isinstance(v[0], list) else []
+            recs = v[1] if len(v) > 1 and isinstance(v[1], list) else []
+            if not (recs and isinstance(recs[0], list) and len(recs[0]) > 5
+                    and isinstance(recs[0][2], str)):
                 continue
-            analysts.append({"id": r[0], "name": r[1], "firm": r[2], "rating": r[3], "date": r[4], "url": r[5] if len(r) > 5 else "", "title": r[16] if len(r) > 16 else ""})
-        return {"summary": summ, "analysts": analysts}
-    except Exception:
-        return {}
+            analysts = []
+            for r in recs[:50]:
+                if not isinstance(r, list) or len(r) < 6:
+                    continue
+                analysts.append({"id": r[0], "name": r[1], "firm": r[2], "rating": r[3], "date": r[4], "url": r[5] if len(r) > 5 else "", "title": r[16] if len(r) > 16 else ""})
+            summary = {}
+            if isinstance(summ, list) and len(summ) >= 11 and isinstance(summ[0], str):
+                # ["Apple","USD",lo,hi,avg_target,...,n,"Buy",buy,hold,sell,...]
+                summary = {"name": summ[0], "cur": summ[1] if len(summ) > 1 else None,
+                           "target_lo": _rnd(summ[2]) if len(summ) > 2 else None,
+                           "target_hi": _rnd(summ[3]) if len(summ) > 3 else None,
+                           "target_avg": _rnd(summ[4]) if len(summ) > 4 else None,
+                           "n": summ[6] if len(summ) > 6 else None,
+                           "consensus": summ[7] if len(summ) > 7 else None,
+                           "buy": summ[8] if len(summ) > 8 else None,
+                           "hold": summ[9] if len(summ) > 9 else None,
+                           "sell": summ[10] if len(summ) > 10 else None}
+            # summary is always a dict; if the header row doesn't match the
+            # known shape we keep the raw row under "raw" instead of
+            # changing the field's type.
+            if not summary and summ:
+                summary = {"raw": summ}
+            return {"summary": summary, "analysts": analysts}
+        except Exception:
+            continue
+    return {}
 
 def _extract_about(blocks: Dict[str, Any]) -> Dict[str, Any]:
+    # Google moved the company-profile record ds:4 -> ds:3 (2026-09).
+    # ds:3 profile: [mid, short_name, description, [city,state,country,code,address],
+    #               [Y,M,D] founded, CEO, employees, mcap, price, ..., sector@71]
+    v3 = blocks.get("ds:3")
+    if v3 and isinstance(v3, list):
+        try:
+            inner = v3[0][0] if isinstance(v3[0], list) and v3[0] and isinstance(v3[0][0], list) else None
+            rec = None
+            if inner is not None:
+                rec = inner[0] if isinstance(inner[0], list) else inner
+            if isinstance(rec, list) and len(rec) > 6 and isinstance(rec[2], str) and len(rec[2]) > 120:
+                hq = rec[3] if isinstance(rec[3], list) else []
+                founded = rec[4] if isinstance(rec[4], list) and len(rec[4]) >= 3 and isinstance(rec[4][0], int) else None
+                return {
+                    "name": rec[1] if isinstance(rec[1], str) else None,
+                    "desc": rec[2][:1500],
+                    "hq": ", ".join(str(x) for x in hq[:5] if x) or None,
+                    "founded": f"{founded[0]:04d}-{founded[1]:02d}-{founded[2]:02d}" if founded else None,
+                    "ceo": rec[5] if isinstance(rec[5], str) else None,
+                    "employees": rec[6] if isinstance(rec[6], (int, float)) else None,
+                    "sector": rec[71] if len(rec) > 71 and isinstance(rec[71], str) else None,
+                }
+        except Exception:
+            pass
     v = blocks.get("ds:4")
     if not v or not isinstance(v, list):
         return {}
@@ -404,8 +516,10 @@ def _extract_about(blocks: Dict[str, Any]) -> Dict[str, Any]:
             return {}
         # ETF vs equity: ETF has different shape, detect
         if len(rec) > 8 and isinstance(rec[2], (int, float)) is False and isinstance(rec[7], (int, float)):
-            # equity path
-            return {"desc": rec[2][:1500] if isinstance(rec[2], str) else "", "name": rec[1], "founded": rec[4] if len(rec) > 4 else None, "ceo": rec[5] if len(rec) > 5 else None, "employees": rec[6] if len(rec) > 6 else None, "sector": rec[-1] if isinstance(rec[-1], str) else None}
+            # equity path (founded normalized to str like the ds:3 path)
+            f4 = rec[4] if len(rec) > 4 else None
+            f4s = f4 if isinstance(f4, str) else (f"{f4[0]:04d}-{f4[1]:02d}-{f4[2]:02d}" if isinstance(f4, list) and len(f4) >= 3 and all(isinstance(x, int) for x in f4[:3]) else None)
+            return {"desc": rec[2][:1500] if isinstance(rec[2], str) else "", "name": rec[1], "founded": f4s, "ceo": rec[5] if len(rec) > 5 else None, "employees": rec[6] if len(rec) > 6 else None, "sector": rec[-1] if isinstance(rec[-1], str) else None}
         # fallback: try any string >100 chars as desc
         desc = ""
         for el in rec:
@@ -417,86 +531,28 @@ def _extract_about(blocks: Dict[str, Any]) -> Dict[str, Any]:
         return {}
 
 
-def _extract_stats(blocks: Dict[str, Any]) -> Dict[str, Any]:
+def _extract_stats(blocks: Dict[str, Any], html: str = "") -> Dict[str, Any]:
+    """Quote statistics. Primary source: the server-rendered stats panel in the
+    page HTML (label div.SwQK7 + value div.dO6ijd) — robust across AF layout
+    drift. The old positional ds:10/ds:5 reads are removed: ds:10 is now a
+    10-field session record and ds:5 the peers block, so both yield garbage."""
     out: Dict[str, Any] = {}
-    # ds:10 detail OHLC + mcap etc
-    v10 = blocks.get("ds:10")
-    try:
-        if v10 and isinstance(v10, list) and len(v10) > 0 and isinstance(v10[0], list) and len(v10[0]) > 0 and isinstance(v10[0][0], list):
-            rec = v10[0][0]
-            if isinstance(rec, list) and len(rec) >= 4:
-                out["open"] = rec[4] if isinstance(rec[4], (int,float)) else None
-                out["high"] = rec[5] if isinstance(rec[5], (int,float)) else None
-                out["low"]  = rec[6] if isinstance(rec[6], (int,float)) else None
-                out["close"] = out.get("close")
-            # deeper: v10[0][0] is [[null,[T,EX]], null, close, mid, open, high, low, ... , mcap at [15]]
-            if isinstance(rec, list) and len(rec) > 16:
-                if isinstance(rec[15], (int,float)):
-                    out["mcap"] = rec[15]
-                if len(rec) > 17 and isinstance(rec[17], (int,float)):
-                    out["vol"] = str(rec[17])
-                if len(rec) > 18 and isinstance(rec[18], str):
-                    out["sector"] = rec[18]
-                # ds:17 duplicate carries prev etc
-    except Exception:
-        pass
-    # ds:17 richer detail (prev, 52w etc) — mirror of ds:10 with extra fields
-    v17 = blocks.get("ds:17")
-    try:
-        if v17 and isinstance(v17, list) and len(v17)>0 and isinstance(v17[0], list) and len(v17[0])>0 and isinstance(v17[0][0], list):
-            r17 = v17[0][0]
-            if isinstance(r17, list) and len(r17) > 15:
-                if "mcap" not in out and len(r17) > 15 and isinstance(r17[15], (int,float)):
-                    out["mcap"] = r17[15]
-                if "vol" not in out and len(r17) > 17 and isinstance(r17[17], (int,float)):
-                    out["vol"] = str(r17[17])
-                if "sector" not in out and len(r17) > 18 and isinstance(r17[18], str):
-                    out["sector"] = r17[18]
-    except Exception:
-        pass
-    # ds:5 ratios: [null, null, [[ticker], r1..r12]]
-    v5 = blocks.get("ds:5")
-    try:
-        if v5 and isinstance(v5, list) and len(v5) > 2 and isinstance(v5[2], list) and len(v5[2]) > 1 and isinstance(v5[2][1], (int,float)):
-            ratios = v5[2]
-            labels = ["pe","eps","beta","div_yield","pe2","eps2","rev","_a","_b","_c","_d","_e"]
-            for i,lab in enumerate(labels):
-                idx = 1+i
-                if idx < len(ratios) and isinstance(ratios[idx], (int,float)):
-                    out[lab] = _rnd(ratios[idx])
-            # ds:5[1] holds [ [ticker], ... ] — keep
-        elif v5 and isinstance(v5, list):
-            # alternate: v5 is [null, null, [[ticker], r..]] nested one more
-            for grp in v5:
-                if isinstance(grp, list) and len(grp)>2 and isinstance(grp[2], list):
-                    cand = grp[2]
-                    if isinstance(cand, list) and len(cand)>1 and isinstance(cand[1], (int,float)):
-                        for i in range(1, min(len(cand), 12)):
-                            out[f"r{i}"] = _rnd(cand[i])
-                        break
-    except Exception:
-        pass
-    # ds:15 valuation: [[ticker], 12 floats] — merge as valuation block
-    v15 = blocks.get("ds:15")
-    try:
-        if v15 and isinstance(v15, list):
-            for grp in v15:
-                if not isinstance(grp, list):
-                    continue
-                for entry in grp:
-                    if isinstance(entry, list) and len(entry) >= 2 and isinstance(entry[0], list) and len(entry[0])==2:
-                        # entry is [[T,EX], f1..f12]
-                        if len(entry) > 1 and isinstance(entry[1], (int,float)):
-                            names = ["beta","pe_ttm","eps_ttm","_x4","_x5","_x6","_x7","mcap2","_x9","_x10","_x11","div2"]
-                            for i,nm in enumerate(names):
-                                if 1+i < len(entry) and isinstance(entry[1+i], (int,float)):
-                                    out.setdefault(nm, _rnd(entry[1+i]))
-                        break
-                break
-    except Exception:
-        pass
-    # clean None/0 placeholders
-    return {k:v for k,v in out.items() if v is not None}
+    if html:
+        try:
+            pairs = re.findall(
+                r'<div class="SwQK7"[^>]*>([^<]+)</div>\s*<div class="dO6ijd"[^>]*>([^<]+)</div>',
+                html)
+            panel: Dict[str, str] = {}
+            for label, val in pairs:
+                label = label.strip()
+                if label and label not in panel:
+                    panel[label] = val.strip()
+            if panel:
+                out["panel"] = panel
+        except Exception:
+            pass
+    return out
+
 
 def _extract_peers(blocks: Dict[str, Any]) -> List[Dict[str, Any]]:
     # Google moved peers ds:6 -> ds:5; ds:6 now holds analyst rows. Try both,
@@ -536,11 +592,11 @@ def _extract_markets_overview(blocks: Dict[str, Any]) -> Dict[str, Any]:
     sectors: List[Dict[str, Any]] = []
     indices: List[Dict[str, Any]] = []
     futures: List[Dict[str, Any]] = []
-    # ds:2 sectors
-    v = blocks.get("ds:2")
+    # sectors moved ds:2 -> ds:1 on the homepage (2026-09)
+    v = blocks.get("ds:1") or blocks.get("ds:2")
     if v:
         try:
-            # ds:2 shape: v = [[["sectors", [...], "Equity sectors", [[sec,...],...]]]]  (double wrapped)
+            # ds:1 shape: v = [[["sectors", [...], "Equity sectors", [[sec,...],...]]]]  (double wrapped)
             inner = v[0][0] if len(v[0]) > 0 and isinstance(v[0][0], list) and len(v[0][0]) > 3 else (v[0] if len(v[0]) > 3 else [])
             recs = inner[3] if len(inner) > 3 and isinstance(inner[3], list) else []
             # recs is flat list of 11 sector records (not grouped)
@@ -629,26 +685,33 @@ def _extract_markets_overview(blocks: Dict[str, Any]) -> Dict[str, Any]:
     return {"sectors": sectors[:30], "indices": indices[:20], "futures": futures[:15]}
 
 def _extract_calendar(blocks: Dict[str, Any]) -> List[Dict[str, Any]]:
-    v = blocks.get("ds:3")
-    if not v or not isinstance(v, list):
-        return []
     out = []
-    # ds:3 on beta is [[[[ticker,ex],date,"title",[mid,[T,EX],Name,q,fy,...[nums]], type, [ts], ...], flag], ...]
-    for grp in v:
-        if not isinstance(grp, list):
+    # earnings calendar moved ds:3 -> ds:2 on the homepage (2026-09);
+    # keep ds:3 as fallback for older page variants
+    for k in ("ds:2", "ds:3"):
+        v = blocks.get(k)
+        if not v or not isinstance(v, list):
             continue
-        for entry in grp:
-            if not isinstance(entry, list) or len(entry) < 3:
+        # ds:2 shape: [[[["JBL","NYSE"],[2026,9,30],"Q4 2026 Earnings Announcement",[...],...]]]
+        for grp in v:
+            if not isinstance(grp, list):
                 continue
-            try:
-                pair = entry[0] if isinstance(entry[0], list) else [None, None]
-                date_arr = entry[1] if isinstance(entry[1], list) else []
-                title = entry[2] if isinstance(entry[2], str) else ""
-                # date_arr like [2026,8,11]
-                dstr = f"{date_arr[0]:04d}-{date_arr[1]:02d}-{date_arr[2]:02d}" if len(date_arr) >= 3 and isinstance(date_arr[0], int) else None
-                out.append({"t": pair[0] if len(pair) > 0 else None, "ex": pair[1] if len(pair) > 1 else None, "date": dstr, "title": title})
-            except Exception:
-                continue
+            for entry in grp:
+                if not isinstance(entry, list) or len(entry) < 3:
+                    continue
+                try:
+                    pair = entry[0] if isinstance(entry[0], list) else [None, None]
+                    date_arr = entry[1] if isinstance(entry[1], list) else []
+                    title = entry[2] if isinstance(entry[2], str) else ""
+                    # date_arr like [2026,9,30]
+                    dstr = (f"{date_arr[0]:04d}-{date_arr[1]:02d}-{date_arr[2]:02d}"
+                            if len(date_arr) >= 3 and all(isinstance(x, int) for x in date_arr[:3])
+                            else None)
+                    out.append({"t": pair[0] if len(pair) > 0 else None, "ex": pair[1] if len(pair) > 1 else None, "date": dstr, "title": title})
+                except Exception:
+                    continue
+        if out:
+            break
     return out[:30]
 
 def _extract_crypto_fx(blocks: Dict[str, Any], kind: str = "crypto") -> List[Dict[str, Any]]:
@@ -690,18 +753,9 @@ def _action_quote(ticker: str, window: str = "") -> str:
     q = _extract_quote(blocks)
     if not q:
         return _err("quote not found — check ticker (try AAPL:NASDAQ, NVDA:NASDAQ, TSLA:NASDAQ, BTC-USD)")
-    ds10 = blocks.get("ds:10")
-    if ds10 and isinstance(ds10, list):
-        try:
-            row = ds10[0][0]
-            if isinstance(row, list) and len(row) >= 18:
-                q["lo"] = _rnd(row[4])
-                q["hi"] = _rnd(row[5])
-                q["op"] = _rnd(row[6]) if len(row) > 6 else None
-                q["vol"] = row[17] if len(row) > 17 else None
-                q["mcap"] = row[16] if len(row) > 16 else None
-        except Exception:
-            pass
+    # ds:10 is now a 10-field session record (see _extract_quote); it carries
+    # no lo/hi/open/vol/mcap fields, so there is nothing to enrich here.
+    # (The old len>=18 positional read was stale and never fired.)
     q["ok"] = True
     q["url"] = url
     about = _extract_about(blocks)
@@ -720,8 +774,8 @@ def _action_history(ticker: str, window: str = "1M") -> str:
         _, blocks = _fetch_blocks(url)
     except Exception as e:
         return _err(f"fetch failed: {e}")
-    daily = _extract_daily(blocks)
-    intraday = _extract_ohlc_intraday(blocks)
+    daily = _daily_series(blocks)
+    bars = _extract_session_bars(blocks)
     minute = _extract_minute(blocks)
     q = _extract_quote(blocks)
     res: Dict[str, Any] = {"ok": True, "t": q.get("t"), "ex": q.get("ex"), "window": w, "url": url}
@@ -734,15 +788,19 @@ def _action_history(ticker: str, window: str = "1M") -> str:
         else:
             res["daily"] = daily
         res["daily_count"] = len(daily)
-    if intraday:
-        spill = _spill(intraday)
+    if bars:
+        # true intraday: today's 5-minute session bars (ds:10)
+        spill = _spill(bars)
         if spill["spilled"]:
             res["intraday_file"] = spill["file"]
             res["intraday_n"] = spill["n"]
             res["intraday_preview"] = spill["preview"]
         else:
-            res["intraday"] = intraday
-        res["intraday_count"] = len(intraday)
+            res["intraday"] = bars
+        res["intraday_count"] = len(bars)
+    # NOTE: the static page only ever carries ~21 daily candles plus today's
+    # session bars, regardless of the requested window. 1D/5D/1Y/5Y/MAX series
+    # need Google's chart RPC (requires running the site JS); not available here.
     if minute:
         spill = _spill(minute)
         if spill["spilled"]:
@@ -752,12 +810,33 @@ def _action_history(ticker: str, window: str = "1M") -> str:
         else:
             res["minute"] = minute
         res["minute_count"] = len(minute)
-    if not daily and not intraday and not minute:
+    if not daily and not bars and not minute:
         return _err("no history parsed — empty ticker or window has no data")
     return _ok(res)
 
 def _action_intraday(ticker: str) -> str:
-    return _action_history(ticker, window="1D")
+    # True intraday: the current session's 5-minute bars from ds:10.
+    # (Previously this just aliased history window=1D, which returns daily candles.)
+    if not ticker or not ticker.strip():
+        return _err("ticker required")
+    try:
+        _, blocks = _fetch_blocks(_quote_url(ticker))
+    except Exception as e:
+        return _err(f"fetch failed: {e}")
+    bars = _extract_session_bars(blocks)
+    q = _extract_quote(blocks) or {}
+    if not bars:
+        return _err("no intraday bars in this page (market may be closed or the page variant lacks them)")
+    spill = _spill(bars)
+    res: Dict[str, Any] = {"ok": True, "t": q.get("t"), "ex": q.get("ex"), "url": _quote_url(ticker)}
+    if spill["spilled"]:
+        res["bars_file"] = spill["file"]
+        res["bars_n"] = spill["n"]
+        res["bars_preview"] = spill["preview"]
+    else:
+        res["bars"] = bars
+    res["bars_count"] = len(bars)
+    return _ok(res)
 
 def _action_fundamentals(ticker: str) -> str:
     if not ticker or not ticker.strip():
@@ -861,7 +940,7 @@ def _action_peers(ticker: str) -> str:
     return _ok({"ok": True, "t": ticker.upper(), "n": len(peers), "peers": peers, "url": url})
 
 def _action_calendar() -> str:
-    url = "https://www.google.com/finance/beta/u/3?pageId=none"
+    url = "https://www.google.com/finance"
     try:
         _, blocks = _fetch_blocks(url)
     except Exception as e:
@@ -872,7 +951,7 @@ def _action_calendar() -> str:
 
 def _action_compare(ticker: str, comparisons: List[str], window: str = "1M") -> str:
     if not ticker or not ticker.strip():
-        return _err("ticker required; comparisons as comma-separated tickers (e.g. compare AAPL:NASDAQ MSFT:NASDAQ,GOOGL:NASDAQ)")
+        return _err("ticker required; comparisons as comma-separated tickers (e.g. compare AAPL:NASDAQ comparisons=MSFT:NASDAQ,GOOGL:NASDAQ)")
     comps = [c.strip().upper() for c in comparisons if c.strip()]
     w = (window or "1M").upper()
     if w not in _VALID_WINDOWS or not w:
@@ -882,7 +961,7 @@ def _action_compare(ticker: str, comparisons: List[str], window: str = "1M") -> 
     for t in [ticker] + comps:
         try:
             _, blocks = _fetch_blocks(_quote_url(t, w))
-            daily = _extract_daily(blocks)
+            daily = _daily_series(blocks)
             q = _extract_quote(blocks)
             # normalize to pct from first close
             norm = []
@@ -896,7 +975,15 @@ def _action_compare(ticker: str, comparisons: List[str], window: str = "1M") -> 
                         base = px
                     pct = ((px - base) / base * 100) if base else 0
                     norm.append({"d": d.get("d"), "p": px, "pct": round(pct, 4)})
-            series[t.upper()] = {"quote": q, "n": len(daily), "norm": norm[:60], "url": _quote_url(t, w)}
+            entry: Dict[str, Any] = {"quote": q, "n": len(daily), "url": _quote_url(t, w)}
+            sp = _spill(norm)
+            if sp["spilled"]:
+                entry["norm_file"] = sp["file"]
+                entry["norm_n"] = sp["n"]
+                entry["norm_preview"] = sp["preview"]
+            else:
+                entry["norm"] = norm
+            series[t.upper()] = entry
         except Exception as e:
             series[t.upper()] = {"error": str(e)}
     return _ok({"ok": True, "window": w, "primary": ticker.upper(), "comparisons": comps, "series": series})
@@ -924,28 +1011,28 @@ def _action_stats(ticker: str) -> str:
     if not ticker:
         return _err("ticker required")
     try:
-        _, blocks = _fetch_blocks(_quote_url(ticker))
+        html, blocks = _fetch_blocks(_quote_url(ticker))
     except Exception as e:
         return _err(f"fetch failed: {e}")
     q = _extract_quote(blocks) or {}
-    st = _extract_stats(blocks) or {}
+    st = _extract_stats(blocks, html) or {}
     return _ok({"ok": True, "t": q.get("t"), "ex": q.get("ex"), "name": q.get("name"), "cur": q.get("cur"), "quote": q, "stats": st, "url": _quote_url(ticker)})
 
 def _action_overview(ticker: str) -> str:
     if not ticker:
         return _err("ticker required")
     try:
-        _, blocks = _fetch_blocks(_quote_url(ticker))
+        html, blocks = _fetch_blocks(_quote_url(ticker))
     except Exception as e:
         return _err(f"fetch failed: {e}")
     q = _extract_quote(blocks) or {}
-    st = _extract_stats(blocks) or {}
+    st = _extract_stats(blocks, html) or {}
     peers = _extract_peers(blocks)
     news = _extract_news(blocks)
     about = _extract_about(blocks)
     top = _extract_analyst(blocks)
-    # history sparkline 1M
-    hist = _extract_daily(blocks)  # 1M sparkline via d:13 daily
+    # history sparkline 1M (with ds:12 fallback when ds:13 lacks the series)
+    hist = _daily_series(blocks)
     return _ok({"ok": True, "t": q.get("t"), "ex": q.get("ex"), "name": q.get("name"), "cur": q.get("cur"),
                 "quote": q, "stats": st, "peers": peers[:6], "news": news[:6], "about": {k: (v[:600] if isinstance(v,str) else v) for k,v in about.items()}, "analyst": top, "history": hist[:30], "url": _quote_url(ticker)})
 
@@ -1060,6 +1147,44 @@ def _action_convert(amount: float, frm: str, to: str) -> str:
             continue
     return _err(f"fx rate not found for {frm}/{to} (tried {pair}, {rev_pair})")
 
+def _extract_etf_sectors(html: str) -> List[Dict[str, Any]]:
+    """Sector performance table on ETF quote pages.
+
+    Rows look like: <div class="sdnoWe">Technology</div> ... <div class="xh20qf">SIXT</div>
+    ... <span class="ymyBi">-0.02%</span>  (sector name, sector index ticker, day change %).
+    Top-10 constituent holdings with weights are JS-rendered and not in static HTML.
+    """
+    out: List[Dict[str, Any]] = []
+    if not html:
+        return out
+    # Split into per-row chunks at each sector-name div, so one malformed
+    # row can never swallow the rows after it (the old single-regex +
+    # whole-loop try/except did exactly that).
+    chunks = re.split(r'<div class="sdnoWe">', html)
+    seen = set()
+    for chunk in chunks[1:]:
+        try:
+            name = chunk.split("</div>", 1)[0].strip()
+            tkr_m = re.search(r'<div class="xh20qf">([^<]+)</div>', chunk)
+            pct_m = re.search(r'<span class="ymyBi">([^<]+)</span>', chunk)
+            tkr = tkr_m.group(1).strip() if tkr_m else ""
+            pct = pct_m.group(1) if pct_m else ""
+            key = (name, tkr)
+            if not name or key in seen:
+                continue
+            seen.add(key)
+            chp = None
+            m = re.search(r"([-+]?\d[\d.,]*)", pct)
+            if m:
+                try:
+                    chp = float(m.group(1).replace(",", ""))
+                except ValueError:
+                    chp = None
+            out.append({"sector": name, "t": tkr, "chp": chp})
+        except Exception:
+            continue
+    return out
+
 def _action_etf(ticker: str) -> str:
     if not ticker or not ticker.strip():
         return _err("ticker required (e.g. SPY:NYSEARCA, QQQ:NASDAQ)")
@@ -1079,7 +1204,8 @@ def _action_etf(ticker: str) -> str:
         except Exception:
             pass
     about = _extract_about(blocks)
-    return _ok({"ok": True, "t": ticker.upper(), "quote": q, "holdings": holdings, "about": about, "url": url})
+    sectors = _extract_etf_sectors(html)
+    return _ok({"ok": True, "t": ticker.upper(), "quote": q, "holdings": holdings, "about": about, "sectors": sectors, "url": url})
 
 # ── Multi-turn Chat (Finance AI) ─────────────────────────────────────────
 
@@ -1383,7 +1509,7 @@ def gfinance_run(action: str = "", ticker: str = "", query: str = "", window: st
             kw2 = {k: v for k, v in kw.items() if k not in ("message", "session", "session_id", "sid", "reset")}
             return _action_chat(message=chat_msg, session=chat_session, reset=bool(kw.get("reset")), **kw2)
         elif a in ("", "help"):
-            return _ok({"ok": True, "actions": ["quote","history","intraday","fundamentals","news","analyst","about","search","markets","peers","compare","calendar","indices","futures","gainers","losers","most_active","trending","crypto","fx","etf","convert","stats","overview","chat"], "examples": ["gfinance quote AAPL:NASDAQ","gfinance history TSLA:NASDAQ window=5D","gfinance peers NVDA:NASDAQ","gfinance compare AAPL:NASDAQ MSFT:NASDAQ,GOOGL:NASDAQ","gfinance calendar","gfinance indices","gfinance futures","gfinance gainers","gfinance crypto","gfinance fx","gfinance etf SPY:NYSEARCA","gfinance convert amount=100 from=USD to=EUR","gfinance chat message='How is NVDA doing vs peers?' session=abc"], "params": {"ticker":"TICKER:EXCH (e.g. AAPL:NASDAQ, 0700:HKG, BTC-USD)","window":"1D|5D|1M|6M|1Y|5Y|MAX","query":"search term","message":"chat message","session":"chat session id (auto-created)","comparisons":"comma-separated tickers"}, "note": "All data from google.com/finance Wiz AF blocks; no API key. Chat is multi-turn with live quotes + optional Gemini enhancement."})
+            return _ok({"ok": True, "actions": ["quote","history","intraday","fundamentals","news","analyst","about","search","markets","peers","compare","calendar","indices","futures","gainers","losers","most_active","trending","crypto","fx","etf","convert","stats","overview","chat"], "examples": ["gfinance quote AAPL:NASDAQ","gfinance history TSLA:NASDAQ window=5D","gfinance peers NVDA:NASDAQ","gfinance compare AAPL:NASDAQ comparisons=MSFT:NASDAQ,GOOGL:NASDAQ","gfinance calendar","gfinance indices","gfinance futures","gfinance gainers","gfinance crypto","gfinance fx","gfinance etf SPY:NYSEARCA","gfinance convert amount=100 from=USD to=EUR","gfinance chat message='How is NVDA doing vs peers?' session=abc"], "params": {"ticker":"TICKER:EXCH (e.g. AAPL:NASDAQ, 0700:HKG, BTC-USD)","window":"1D|5D|1M|6M|1Y|5Y|MAX","query":"search term","message":"chat message","session":"chat session id (auto-created)","comparisons":"comma-separated tickers"}, "note": "All data from google.com/finance Wiz AF blocks; no API key. Chat is multi-turn with live quotes + optional Gemini enhancement."})
         else:
             return _err(f"unknown action '{action}'. valid: quote, history, intraday, fundamentals, news, analyst, about, search, markets, peers, compare, calendar, indices, futures, gainers, losers, most_active, trending, crypto, fx, etf, convert, stats, overview, chat")
     except Exception as e:
@@ -1425,17 +1551,7 @@ try:
         name="gfinance",
         toolset="gfinance",
         schema=GFINANCE_SCHEMA,
-        handler=lambda args, **kw: gfinance_run(
-            action=args.get("action", ""),
-            ticker=args.get("ticker", ""),
-            query=args.get("query", ""),
-            window=args.get("window", ""),
-            message=args.get("message", ""),
-            session=args.get("session", ""),
-            comparisons=args.get("comparisons", ""),
-            amount=args.get("amount", ""),
-            **{**args, **kw},
-        ),
+        handler=lambda args, **kw: gfinance_run(**{**args, **kw}),
         check_fn=_check,
         description=GFINANCE_SCHEMA["description"],
         emoji="📈",
