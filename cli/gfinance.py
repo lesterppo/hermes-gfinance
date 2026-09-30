@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Standalone CLI wrapper for gfinance_tool — also usable outside Hermes."""
-import sys, json, argparse
-sys.path.insert(0, "~/.hermes/plugins/hermes_local_tools")
+import sys, json, argparse, os
+sys.path.insert(0, os.path.expanduser("~/.hermes/plugins/hermes_local_tools"))
 import gfinance_tool
 
 def main():
@@ -20,6 +20,11 @@ def main():
         except: print(out)
     else:
         print(out)
+    # match the other finance CLIs: exit 2 when the result is an error
+    try:
+        sys.exit(0 if json.loads(out).get("ok") else 2)
+    except Exception:
+        sys.exit(0)
 
 if __name__=="__main__":
     main()

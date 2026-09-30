@@ -141,15 +141,22 @@ def _rnd(v):
     return v
 
 def _extract_quote(blocks: Dict[str, Any]) -> Dict[str, Any]:
-    for k in ("ds:3", "ds:16", "ds:10", "ds:17", "ds:15"):
+    for k in ("ds:2", "ds:3", "ds:16", "ds:10", "ds:17", "ds:15"):
         v = blocks.get(k)
         if not v:
             continue
         try:
-            if k in ("ds:3", "ds:16"):
+            if k in ("ds:2", "ds:3", "ds:16"):
                 inner = v[0][0]
                 rec = inner[0] if isinstance(inner[0], list) else inner
                 if len(rec) < 8:
+                    continue
+                # Google repurposed ds:3 as a company-profile record
+                # (description/HQ/founded/CEO at the old quote positions). A
+                # real quote record always carries rec[5] = [price, chg,
+                # chgpct, ...] with a numeric price — skip anything else.
+                price_arr_chk = rec[5] if isinstance(rec[5], list) else []
+                if not (len(price_arr_chk) >= 1 and isinstance(price_arr_chk[0], (int, float))):
                     continue
                 mid = rec[0]
                 pair = rec[1] if isinstance(rec[1], list) else [None, None]
@@ -347,7 +354,8 @@ def _extract_fundamentals(blocks: Dict[str, Any]) -> Dict[str, Any]:
 
 def _extract_news(blocks: Dict[str, Any]) -> List[Dict[str, Any]]:
     out = []
-    for k in ("ds:19", "ds:20"):
+    # Google moved news ds:19/ds:20 -> ds:15/ds:16; keep the old keys as fallback.
+    for k in ("ds:15", "ds:16", "ds:19", "ds:20"):
         v = blocks.get(k)
         if not v or not isinstance(v, list):
             continue
@@ -357,7 +365,7 @@ def _extract_news(blocks: Dict[str, Any]) -> List[Dict[str, Any]]:
             if len(entry) >= 3 and isinstance(entry[0], str) and entry[0].startswith("http"):
                 out.append({"url": entry[0], "title": entry[1] if len(entry) > 1 else "", "src": entry[2] if len(entry) > 2 else "", "ts": entry[4] if len(entry) > 4 else None})
     if not out:
-        for k in ("ds:19", "ds:20"):
+        for k in ("ds:15", "ds:16", "ds:19", "ds:20"):
             v = blocks.get(k)
             if not v:
                 continue
@@ -491,29 +499,38 @@ def _extract_stats(blocks: Dict[str, Any]) -> Dict[str, Any]:
     return {k:v for k,v in out.items() if v is not None}
 
 def _extract_peers(blocks: Dict[str, Any]) -> List[Dict[str, Any]]:
-    v = blocks.get("ds:6")
-    if not v or not isinstance(v, list):
-        return []
-    out = []
-    for grp in v:
-        if not isinstance(grp, list):
+    # Google moved peers ds:6 -> ds:5; ds:6 now holds analyst rows. Try both,
+    # return the first that yields real quote records.
+    for bk in ("ds:5", "ds:6"):
+        v = blocks.get(bk)
+        if not v or not isinstance(v, list):
             continue
-        for rec in grp:
-            if not isinstance(rec, list) or len(rec) < 6:
+        out = []
+        for grp in v:
+            if not isinstance(grp, list):
                 continue
-            # rec shape: ["/m/xxx", [T,EX], "Name", 0, "USD", [p,ch,pct,...], null, prev, color, country, ...]
-            try:
-                mid = rec[0]
-                pair = rec[1] if isinstance(rec[1], list) else [None, None]
-                name = rec[2]
-                price_arr = rec[5] if isinstance(rec[5], list) else []
-                p = price_arr[0] if len(price_arr) > 0 else None
-                ch = price_arr[1] if len(price_arr) > 1 else None
-                chp = price_arr[2] if len(price_arr) > 2 else None
-                out.append({"t": pair[0] if len(pair) > 0 else None, "ex": pair[1] if len(pair) > 1 else None, "name": name, "p": _rnd(p), "ch": _rnd(ch), "chp": _rnd(chp), "mid": mid})
-            except Exception:
-                continue
-    return out[:20]
+            for rec in grp:
+                if not isinstance(rec, list) or len(rec) < 6:
+                    continue
+                # skip non-quote records (analyst rows, etc.)
+                price_arr_chk = rec[5] if isinstance(rec[5], list) else []
+                if not (len(price_arr_chk) >= 1 and isinstance(price_arr_chk[0], (int, float))):
+                    continue
+                # rec shape: ["/m/xxx", [T,EX], "Name", 0, "USD", [p,ch,pct,...], null, prev, color, country, ...]
+                try:
+                    mid = rec[0]
+                    pair = rec[1] if isinstance(rec[1], list) else [None, None]
+                    name = rec[2]
+                    price_arr = rec[5] if isinstance(rec[5], list) else []
+                    p = price_arr[0] if len(price_arr) > 0 else None
+                    ch = price_arr[1] if len(price_arr) > 1 else None
+                    chp = price_arr[2] if len(price_arr) > 2 else None
+                    out.append({"t": pair[0] if len(pair) > 0 else None, "ex": pair[1] if len(pair) > 1 else None, "name": name, "p": _rnd(p), "ch": _rnd(ch), "chp": _rnd(chp), "mid": mid})
+                except Exception:
+                    continue
+        if out:
+            return out[:20]
+    return []
 
 def _extract_markets_overview(blocks: Dict[str, Any]) -> Dict[str, Any]:
     sectors: List[Dict[str, Any]] = []
